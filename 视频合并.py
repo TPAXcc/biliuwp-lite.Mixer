@@ -279,8 +279,7 @@ class FFMPEGMergerGUI:
             if not os.path.exists(ffmpeg_folder):
                 os.makedirs(ffmpeg_folder)
             
-            # 示例 URL，用于下载 ffmpeg，请根据实际需要调整。
-            url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+            url = "https://ghproxy.vip/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
             self.download_ffmpeg(url, ffmpeg_folder)
             print("ffmpeg 已下载并解压完成。")
 

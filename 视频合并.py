@@ -1,13 +1,14 @@
 import os
-import re
 import json
 import subprocess
+import requests
 import concurrent.futures
-import shutil
 import zipfile
 import fnmatch
+from tkinter import Tk, Button, Label, StringVar, filedialog
 from tqdm import tqdm
-from tkinter import Tk, Button, Label, StringVar, filedialog, messagebox, Listbox, Scrollbar, Frame, Toplevel, END
+import sys
+import ctypes
 
 class FFMPEGMergerGUI:
     def __init__(self, master):
@@ -47,6 +48,9 @@ class FFMPEGMergerGUI:
         # 立即检查并下载 FFmpeg，并传递当前脚本所在目录
         current_dir = os.path.dirname(os.path.realpath(__file__))
         self.ensure_ffmpeg_installed(current_dir)
+        
+        # 关键修复：设置FFmpeg使用UTF-8路径
+        os.environ["FFMPEG_UTF8_PATHS"] = "1"
 
     def select_folder(self):
         folder_selected = filedialog.askdirectory()
@@ -61,178 +65,149 @@ class FFMPEGMergerGUI:
     def start_merge(self):
         base_dir = self.folder_path_var.get()
         output_dir = self.output_path_var.get()
-        
-        if not base_dir or not output_dir:
-            self.label.config(text="请先选择输入和输出文件夹！")
-            return
-
-        root_info_json_path = os.path.join(base_dir, 'info.json')
-        
-        if not os.path.isfile(root_info_json_path):
-            self.label.config(text="根目录下的 info.json 文件不存在！")
-            return
-
-        with open(root_info_json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        if 'Title' not in data:
-            self.label.config(text="根目录下的 info.json 缺少 Title 字段！")
-            return
-
-        # 正确初始化 episode_title
-        episode_title = data['Title']
-
-        # 定义要被替换的非法字符列表
-        illegal_chars = ['/', ':', '[', '\\', '*', '?', '"', '<', '>', '|', ']']
-
-        # 使用循环遍历非法字符并替换
-        for char in illegal_chars:
-            episode_title = episode_title.replace(char, '')
-
-        # 进一步清理标题，确保没有其他问题字符
-        episode_title = re.sub(r'[^\w\s-]', '', episode_title)  # 移除非字母数字字符
-        episode_title = re.sub(r'[-\s]+', '-', episode_title).strip('-')  # 替换空白和连字符为单个连字符，并去除开头和结尾的连字符
-
-        # 检查长度，如果太长，则截断
-        max_length = 245  # 假设留一些余地给路径中的其他部分
-        if len(episode_title) > max_length:
-            episode_title = episode_title[:max_length]
-
-        # 使用 episode_title 创建目录
-        output_subfolder = os.path.join(output_dir, episode_title)
-        os.makedirs(output_subfolder, exist_ok=True)
-        
-        tasks = []
-        confirmations = []
-        for root, dirs, files in os.walk(base_dir):
-            if 'info.json' in files:
-                if root == base_dir:  # Skip the root level's info.json since we already read it.
-                    continue
-                with open(os.path.join(root, 'info.json'), 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if 'VideoPath' not in data:
-                        self.label.config(text=f"子目录 {root} 下的 info.json 缺少 VideoPath 字段！")
-                        return
-                    elif not isinstance(data['VideoPath'], list) or len(data['VideoPath']) < 2:
-                        self.label.config(text=f"子目录 {root} 下的 info.json VideoPath 字段格式错误！")
-                        return
-                    if 'EpisodeTitle' not in data:
-                        self.label.config(text=f"子目录 {root} 下的 info.json 缺少 EpisodeTitle 字段！")
-                        return
-
-                    video_file = os.path.join(root, data['VideoPath'][0])
-                    audio_file = os.path.join(root, data['VideoPath'][1])
-
-                    if not os.path.exists(video_file):
-                        self.label.config(text=f"视频文件 {video_file} 不存在！")
-                        return
-                    elif not os.path.exists(audio_file):
-                        self.label.config(text=f"音频文件 {audio_file} 不存在！")
-                        return
-
-                    output_file = os.path.join(output_subfolder, f"{data['EpisodeTitle']}.mp4")
-                    
-                    if os.path.exists(output_file):
-                        # 获取输出文件的大小
-                        output_size = os.path.getsize(output_file)
+        if base_dir:
+            tasks = []
+            for root, dirs, files in os.walk(base_dir):
+                if 'info.json' in files:
+                    info_path = os.path.join(root, 'info.json')
+                    try:
+                        # 使用系统默认编码读取JSON文件（解决中文路径问题）
+                        with open(info_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
                         
-                        # 计算视频和音频文件的总大小
-                        source_size = os.path.getsize(video_file) + os.path.getsize(audio_file)
-                        
-                        # 转换大小为常见单位
-                        output_size_human = self.human_readable_size(output_size)
-                        source_size_human = self.human_readable_size(source_size)
-                        
-                        confirmations.append((output_file, source_size, output_size, source_size_human, output_size_human))
-                    else:
-                        tasks.append((video_file, audio_file, output_file))
+                        # 检查必要的字段是否存在
+                        if ('VideoPath' in data and 
+                            isinstance(data['VideoPath'], list) and 
+                            len(data['VideoPath']) >= 2 and
+                            'EpisodeTitle' in data):
+                            
+                            # 获取Index字段（如果不存在则使用0）
+                            index = str(data.get('Index', '0')).strip()
+                            # 确保Index是数字格式，如果不是则使用0
+                            if not index.isdigit():
+                                index = '0'
+                            
+                            # 规范化路径 - 关键修复！
+                            video_file = os.path.normpath(os.path.join(root, data['VideoPath'][0]))
+                            audio_file = os.path.normpath(os.path.join(root, data['VideoPath'][1]))
+                            episode_title = data['EpisodeTitle']
+                            
+                            # 处理文件名中的非法字符（Windows文件名不允许使用某些字符）
+                            episode_title = self.sanitize_filename(episode_title)
+                            
+                            # 修改输出文件名格式：P Index EpisodeTitle.mp4
+                            output_file = os.path.normpath(os.path.join(output_dir, f"P{index} {episode_title}.mp4"))
 
-        if confirmations:
-            self.show_confirmation(confirmations)
+                            # 添加到任务列表
+                            tasks.append((video_file, audio_file, output_file))
+                    except json.JSONDecodeError:
+                        print(f"警告：{info_path} 文件格式错误，跳过处理")
+                    except Exception as e:
+                        print(f"处理 {info_path} 时出错: {str(e)}")
 
-        # 使用线程池来并发处理所有任务
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            with tqdm(total=len(tasks), desc="正在合并文件") as pbar:
-                for task in tasks:
-                    future = executor.submit(self.handle_ffmpeg_operations_with_progress, task[0], task[1], task[2], pbar)
-                    futures.append(future)
+            # 使用线程池来并发处理所有任务
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(self.handle_ffmpeg_operations, *task) for task in tasks]
                 concurrent.futures.wait(futures)
 
-        self.label.config(text="合并完成！")
+            self.label.config(text="合并完成！")
+        else:
+            self.label.config(text="请先选择文件夹！")
 
-    def show_confirmation(self, confirmations):
-        top = Toplevel(self.master)
-        top.title("确认操作")
+    def sanitize_filename(self, filename):
+        """移除Windows文件名中的非法字符"""
+        # Windows文件名不允许的字符: \ / : * ? " < > |
+        invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|']
+        for char in invalid_chars:
+            filename = filename.replace(char, '')
+        # 移除结尾的句点和空格（Windows不允许）
+        filename = filename.rstrip('. ')
+        return filename
 
-        frame = Frame(top)
-        frame.pack(side="left", fill="both", expand=True)
-
-        # 添加滚动条
-        scrollbar = Scrollbar(frame)
-        scrollbar.pack(side="right", fill="y")
-
-        listbox = Listbox(frame, yscrollcommand=scrollbar.set)
-        listbox.pack(side="left", fill="both", expand=True)
-
-        # 设置滚动条的回调函数
-        scrollbar.config(command=listbox.yview)
-
-        for output_path, source_size, output_size, source_size_human, output_size_human in confirmations:
-            item = f"{output_path}\n"
-            item += f"  - 源文件大小：{source_size_human}\n"
-            item += f"  - 输出文件大小：{output_size_human}\n\n"
-            listbox.insert(END, item)
-
-        # 添加确认按钮
-        button_frame = Frame(top)
-        button_frame.pack(side="bottom")
-
-        confirm_button = Button(button_frame, text="确认", command=lambda: self.confirm_action(confirmations, top))
-        confirm_button.pack(side="left")
-
-        cancel_button = Button(button_frame, text="取消", command=top.destroy)
-        cancel_button.pack(side="right")
-
-    def confirm_action(self, confirmations, top):
-        top.destroy()
-        # 用户选择确认后，处理这些确认项
-        tasks.extend([(conf[0], conf[1], conf[2]) for conf in confirmations])
-        # 更新任务列表并重新启动合并
-        self.start_merge()
-
-    def handle_ffmpeg_operations_with_progress(self, video_path, audio_path, output_path, pbar):
-        # 由于在多线程环境下，可能需要确保 ffmpeg 路径的正确性
+    def handle_ffmpeg_operations(self, video_path, audio_path, output_path):
+        # 检查文件是否存在
+        if not os.path.exists(video_path):
+            print(f"错误：视频文件不存在 - {video_path}")
+            return
+        if not os.path.exists(audio_path):
+            print(f"错误：音频文件不存在 - {audio_path}")
+            return
+        
+        # 关键修复1：将路径转换为UTF-8编码的字节串
+        # 这是解决中文路径问题的核心
+        video_path_utf8 = video_path.encode('utf-8')
+        audio_path_utf8 = audio_path.encode('utf-8')
+        output_path_utf8 = output_path.encode('utf-8')
+        
+        # 关键修复2：获取FFmpeg路径
         ffmpeg_path = self.find_ffmpeg(os.path.dirname(os.path.realpath(__file__)))
+        if not ffmpeg_path:
+            print("错误：未找到ffmpeg可执行文件")
+            return
+        
+        # 关键修复3：直接使用字节串构建命令（避免编码转换问题）
         command = [
-            ffmpeg_path, "-i", video_path, "-i", audio_path,
-            "-c", "copy", "-map", "0:v:0", "-map", "1:a:0",
-            "-y", output_path
+            ffmpeg_path.encode('utf-8'), 
+            b"-i", video_path_utf8, 
+            b"-i", audio_path_utf8,
+            b"-c", b"copy", 
+            b"-map", b"0:v:0", 
+            b"-map", b"1:a:0",
+            b"-y", 
+            output_path_utf8
         ]
+        
+        # 打印实际执行的命令（用于调试）
+        print(f"执行命令: {' '.join([arg.decode('utf-8', errors='replace') for arg in command])}")
+        
         self.execute_ffmpeg_command(command, output_path)
-        pbar.update(1)
 
     def execute_ffmpeg_command(self, command, output_path):
-        with open(os.devnull, "w") as f:
-            process = subprocess.Popen(command, stdout=f, stderr=f)
-        
-            # 等待 ffmpeg 进程结束
-            process.wait()
-        
-            if process.returncode == 0:
-                print(f"文件 {output_path} 合并成功！")
-            else:
-                print(f"合并 {output_path} 失败！错误码：{process.returncode}")
+        # 关键修复4：使用STARTUPINFO隐藏控制台窗口（Windows专属）
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # 隐藏窗口
 
-    def human_readable_size(self, size):
-        # 转换大小为常见单位
-        for x in ['bytes', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return "%3.1f %s" % (size, x)
-            size /= 1024.0
-        return "%3.1f %s" % (size, 'TB')
+        # 关键修复5：使用字节串调用，避免编码问题
+        # 移除shell=True，直接传递字节串命令
+        process = subprocess.Popen(
+            command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo
+        )
+        
+        # 实时读取并打印 FFmpeg 的输出（使用UTF-8解码）
+        while True:
+            line = process.stderr.readline()
+            if not line:
+                break
+            try:
+                # 尝试用UTF-8解码
+                print(line.decode('utf-8', errors='replace').strip())
+            except:
+                # 失败则用系统编码
+                print(line.decode(sys.getfilesystemencoding(), errors='replace').strip())
+        
+        # 等待 ffmpeg 进程结束
+        process.wait()
+        
+        if process.returncode == 0:
+            print(f"文件 {output_path} 合并成功！")
+        else:
+            print(f"合并 {output_path} 失败！错误码：{process.returncode}")
+            # 打印完整的错误信息
+            try:
+                stderr = process.stderr.read().decode('utf-8', errors='replace')
+            except:
+                stderr = process.stderr.read().decode(sys.getfilesystemencoding(), errors='replace')
+            if stderr:
+                print("FFmpeg 详细错误信息:")
+                print(stderr)
 
-    def download_ffmpeg(self, url, destination_folder):导入fnmatch
+    def download_ffmpeg(self, url, destination_folder):
         response = requests.get(url, stream=True)
         response.raise_for_status()
 
@@ -260,16 +235,27 @@ class FFMPEGMergerGUI:
         # 遍历 start_path 及其子目录寻找 ffmpeg.exe
         for dirpath, dirnames, filenames in os.walk(start_path):
             for filename in fnmatch.filter(filenames, 'ffmpeg.exe'):
-                return os.path.join(dirpath, filename)
-        return None返回None
+                ffmpeg_path = os.path.join(dirpath, filename)
+                # 返回规范化路径
+                return os.path.normpath(ffmpeg_path)
+        return None
 
     def detect_ffmpeg(self):
         current_dir = os.path.dirname(os.path.realpath(__file__))
         ffmpeg_path = self.find_ffmpeg(current_dir)
+        if ffmpeg_path is None:
+            return False
         try:
-            subprocess.run([ffmpeg_path, "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # 关键修复6：使用字节串调用版本检查
+            result = subprocess.run(
+                [ffmpeg_path.encode('utf-8'), b"-version"], 
+                check=True, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE
+            )
             return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"FFmpeg检测失败: {str(e)}")
             return False
 
     def ensure_ffmpeg_installed(self, base_dir):
